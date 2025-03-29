@@ -207,15 +207,35 @@ Test Result: {'PASS' if self._check_test_criteria() else 'FAIL'}
         test_cases = [
             {
                 "message": "What visa options are available for software engineers?",
-                "expected_keywords": ["H-1B", "O-1", "software", "engineer"]
+                "expected_keywords": ["H-1B", "O-1", "software", "engineer", "visa"]
             },
             {
                 "message": "How long does H1B processing take?",
-                "expected_keywords": ["process", "time", "H-1B", "USCIS"]
+                "expected_keywords": ["process", "time", "H-1B", "USCIS", "months"]
             },
             {
                 "message": "Generate a timeline for my H1B application",
                 "expected_keywords": ["timeline", "application", "process", "steps"]
+            },
+            {
+                "message": "I'm a PhD student in AI, what are my options after graduation?",
+                "expected_keywords": ["OPT", "STEM", "H-1B", "research", "PhD"]
+            },
+            {
+                "message": "My spouse is on H1B, can I work?",
+                "expected_keywords": ["H-4", "EAD", "dependent", "spouse", "work permit"]
+            },
+            {
+                "message": "What happens if I lose my job on H1B?",
+                "expected_keywords": ["grace period", "60 days", "transfer", "status"]
+            },
+            {
+                "message": "Can I start a company while on H1B?",
+                "expected_keywords": ["entrepreneur", "business", "ownership", "employment"]
+            },
+            {
+                "message": "Tell me about the EB-1 visa requirements",
+                "expected_keywords": ["extraordinary ability", "outstanding", "achievement", "criteria"]
             }
         ]
 

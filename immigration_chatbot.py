@@ -3,28 +3,29 @@
 import os
 import sys
 from typing import List, Dict, Optional, Any, Union, Tuple
-from functools import lru_cache
 import json
 import time
 import signal
-import logging
+import socket
 import asyncio
-from collections import defaultdict
-from dataclasses import dataclass, field
+import random
 import numpy as np
 from datetime import datetime, timedelta
+import hashlib
+import re
 
 # OpenAI imports
-import openai
-from openai.embeddings_utils import get_embedding
+from openai import OpenAI
 
 # FastAPI imports
-from fastapi import FastAPI, Request, HTTPException, Depends, Security
-from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
-from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, Request, Security, HTTPException, Depends
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
+
+# Rate limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -33,40 +34,39 @@ from slowapi.errors import RateLimitExceeded
 from dotenv import load_dotenv
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Constants
+MAX_CACHE_SIZE = 1000  # Maximum number of items in each cache
+CACHE_TTL = 3600  # Default cache TTL in seconds
+RESPONSE_CACHE_TTL = 300  # Response cache TTL in seconds
+CHUNK_SIZE = 1500  # Default chunk size for text processing
 
 # Initialize rate limiter
 limiter = Limiter(key_func=get_remote_address)
 
-# Initialize FastAPI app
-app = FastAPI()
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# Initialize conversation history storage
+conversation_histories = {}
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific origins
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Set up API key authentication
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+api_key_header = APIKeyHeader(name="X-API-Key")
 
-async def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != os.getenv("API_KEY"):
-        raise HTTPException(
-            status_code=403,
-            detail="Could not validate API key"
-        )
-    return api_key
+def verify_api_key(api_key: str = Security(api_key_header)):
+    """Verify the API key."""
+    if api_key == "test_key_123":  # This should match the key in chat.html
+        return api_key
+    raise HTTPException(
+        status_code=403,
+        detail="Could not validate API key"
+    )
 
-# PDF generation imports
+import logging
+from functools import lru_cache
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import asyncio
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -185,348 +185,6 @@ AVAILABLE_FUNCTIONS = {
         }
     }
 }
-
-async def stream_response(response_text: str):
-    """Stream response with typewriter effect."""
-    words = response_text.split()
-    current_text = ""
-    
-    for i, word in enumerate(words):
-        current_text += word + " "
-        
-        # Format the response as a proper SSE message
-        message = {
-            "type": "stream",
-            "content": current_text.strip()
-        }
-        yield f"data: {json.dumps(message)}\n\n"
-        await asyncio.sleep(0.05)  # Add small delay for typewriter effect
-    
-    # Send end message
-    yield f"data: {json.dumps({'type': 'end'})}\n\n"
-
-app = FastAPI()
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Initialize OpenAI client
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# Constants
-MAX_CACHE_SIZE = 1000  # Maximum number of items in each cache
-CACHE_TTL = 3600  # Default cache TTL in seconds
-RESPONSE_CACHE_TTL = 300  # Response cache TTL in seconds
-CHUNK_SIZE = 1500  # Default chunk size for text processing
-
-@dataclass
-class ConversationState:
-    """Tracks the state of a conversation with a user."""
-    current_question_group: Optional[str] = None
-    questions_asked: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
-    answers_received: Dict[str, Dict[str, str]] = field(default_factory=lambda: defaultdict(dict))
-
-    def add_answer(self, group: str, question: str, answer: str) -> None:
-        """Add an answer to the conversation state."""
-        self.answers_received[group][question] = answer
-        if question not in self.questions_asked[group]:
-            self.questions_asked[group].append(question)
-
-    def get_next_question(self, group: str, questions: List[str]) -> Optional[str]:
-        """Get the next unanswered question from a group."""
-        for question in questions:
-            if question not in self.questions_asked[group]:
-                return question
-        return None
-
-@dataclass
-class Cache:
-    """Thread-safe cache with size limit and TTL."""
-    ttl_seconds: int
-    max_size: int = MAX_CACHE_SIZE
-    _cache: Dict[str, Tuple[Any, float]] = field(default_factory=dict)
-    
-    def get(self, key: str) -> Optional[Any]:
-        """Get a value from cache if it exists and hasn't expired."""
-        if key in self._cache:
-            value, timestamp = self._cache[key]
-            if time.time() - timestamp <= self.ttl_seconds:
-                return value
-            del self._cache[key]
-        return None
-
-    def set(self, key: str, value: Any) -> None:
-        """Set a value in cache with timestamp."""
-        self._clear_expired()
-        if len(self._cache) >= self.max_size:
-            # Remove oldest item if cache is full
-            oldest_key = min(self._cache.items(), key=lambda x: x[1][1])[0]
-            del self._cache[oldest_key]
-        self._cache[key] = (value, time.time())
-
-    def _clear_expired(self) -> None:
-        """Remove expired items from cache."""
-        current_time = time.time()
-        expired_keys = [
-            k for k, (_, timestamp) in self._cache.items()
-            if current_time - timestamp > self.ttl_seconds
-        ]
-        for k in expired_keys:
-            del self._cache[k]
-
-# Initialize caches with size limits
-chunk_cache = Cache(ttl_seconds=CACHE_TTL)
-embedding_cache = Cache(ttl_seconds=CACHE_TTL)
-response_cache = Cache(ttl_seconds=RESPONSE_CACHE_TTL)
-
-LEGAL_CONTEXT = """I am Natalie, an expert immigration advisor specializing in helping extraordinary individuals 
-navigate their US immigration journey, particularly in the technology sector. I combine deep legal expertise 
-with genuine care for each person's unique situation.
-
-MY APPROACH:
-- I am warm and empathetic, but always focused on achieving immigration success
-- I provide clear, actionable guidance based on proven pathways
-- I'm direct about requirements and potential challenges
-- I help identify and strengthen qualifying evidence
-- I keep conversations on track toward concrete immigration solutions
-
-GUIDING PRINCIPLES:
-- Every question gets a clear, actionable answer
-- Empathy without compromising on requirements
-- Honest assessment of chances and alternatives
-- Strategic thinking about long-term immigration goals
-- Proactive identification of potential issues
-
-IMMIGRATION EXPERTISE (2025):
-1. Strategic Assessment:
-   - Quick evaluation of strongest visa pathways
-   - Clear identification of evidence gaps
-   - Realistic timeline expectations
-   - Risk assessment and mitigation
-   - Alternative pathway planning
-
-2. Success Requirements:
-   - Specific evidence thresholds
-   - Documentation standards
-   - Timeline considerations
-   - Common pitfalls to avoid
-   - Strategic strengthening of cases
-
-CURRENT PRIORITIES:
-- Focus on concrete evidence gathering
-- Clear qualification assessment
-- Strategic documentation planning
-- Timeline management
-- Risk mitigation strategies
-
-When discussing cases:
-1. Assess current qualifications
-2. Identify evidence gaps
-3. Provide specific action items
-4. Set clear expectations
-5. Address potential challenges
-6. Outline next steps
-
-COMMUNICATION STYLE:
-- Warm but focused on solutions
-- Clear and direct about requirements
-- Supportive while maintaining standards
-- Strategic in guidance
-- Proactive about potential issues"""
-
-SYSTEM_INSTRUCTION = """Act as Natalie, an immigration expert who combines warmth with unwavering focus on 
-immigration success. While being empathetic and understanding, always guide the conversation toward concrete 
-immigration solutions. Be direct about requirements and challenges, but deliver this information with care 
-and support. Every response should move the candidate closer to their immigration goals through clear, 
-actionable guidance."""
-
-INITIAL_QUESTIONS = [
-    "What is your current visa status and when does it expire?",
-    "Could you tell me about your educational background - degrees, majors, and institutions?",
-    "What's your current role and experience level in your field?",
-    "Have you had any previous US visas?",
-    "Are you currently employed? If so, what's your role and company?",
-    "For founders: Could you tell me about your company's stage and your role in it?",
-    "Do you have family members who would need visa consideration?",
-    "Are there any immediate timeline concerns we should discuss?"
-]
-
-WELCOME_MESSAGE = """Hello fellow tech enthusiast! 👋 I'm Natalie, and I specialize in helping professionals like yourself navigate the US immigration system. With the recent focus on AI/ML pathways and emerging technologies, I'm particularly excited to explore your options together.
-
-I understand immigration can feel overwhelming, but I'm here to make this journey clearer for you. Let's start by getting to know your situation better."""
-
-FOLLOW_UP_QUESTIONS = {
-    'recent_grad': [
-        "Could you tell me more about your internship experience. What kind of projects did you work on?",
-        "Did you participate in any research projects during your studies?",
-        "Have you published any papers or contributed to open-source projects?",
-        "Were you involved in any notable hackathons or coding competitions?",
-        "Did you receive any academic awards or scholarships?",
-        "What was your GPA, and did you have any specializations?",
-        "Are you currently employed or have any job offers?",
-        "Are you on F-1 status? If so, have you applied for OPT?",
-        "Do you have any specific companies or roles in mind?",
-        "What are your long-term career goals in the US?"
-    ],
-    'tech_professional': [
-        "Could you share more about your specific achievements in your current role?",
-        "Have you led any significant projects or innovations?",
-        "Do you have any patents or publications?",
-        "Have you received recognition from industry peers or media?",
-        "What's your role in the tech community (speaking, mentoring, etc.)?",
-        "Do you have any unique expertise or specializations?",
-        "Are you currently working with a US company?",
-        "What's your current visa status and timeline?",
-        "Have you considered multiple visa pathways?",
-        "What are your long-term goals in the US tech industry?"
-    ],
-    'startup_founder': [
-        "Could you tell me about your company's current stage and funding?",
-        "What's your role and ownership percentage?",
-        "Have you received any notable investments or recognition?",
-        "Do you have any patents or innovative technologies?",
-        "What's your company's potential impact on the US market?",
-        "How many employees do you have or plan to hire?",
-        "What's your timeline for US market entry?",
-        "Have you established any US business relationships?",
-        "What's your current location and business structure?",
-        "What are your growth projections for the next 2-3 years?"
-    ]
-}
-
-SOLUTION_FRAMEWORKS = {
-    'recent_grad': {
-        'immediate_options': [
-            "OPT (12 months + 24-month STEM extension)",
-            "H-1B through employer sponsorship",
-            "Cap-exempt H-1B opportunities",
-            "J-1 training or research programs",
-            "O-1A preparation strategy"
-        ],
-        'medium_term': [
-            "Advanced degree pursuit (Master's/PhD)",
-            "Building specialized expertise",
-            "Research and publications",
-            "Industry recognition development",
-            "Professional network building"
-        ],
-        'long_term': [
-            "EB-1A qualification building",
-            "EB-2 NIW pathway",
-            "Employer-sponsored options",
-            "Entrepreneurship pathways",
-            "Dual intent visa strategies"
-        ]
-    }
-}
-
-# Personality traits for different response types
-PERSONALITY_TRAITS = {
-    "greeting": [
-        "I'm Natalie, your dedicated immigration specialist. How may I assist you with your immigration journey today?",
-        "Welcome, I'm Natalie, your immigration advisor. I'm here to guide you through the immigration process. What can I help you with?",
-        "Greetings, I'm Natalie, your immigration partner. I specialize in helping professionals navigate their immigration path. How can I assist you?"
-    ],
-    "understanding": [
-        "I understand your immigration concerns. Let me help you navigate this.",
-        "Based on what you've shared, I can guide you through the next steps.",
-        "I see your situation clearly. Let me provide you with specific guidance."
-    ],
-    "clarification": [
-        "To provide you with the most accurate guidance, could you please clarify something for me?",
-        "Let me ensure I have all the details correct. Could you confirm something?",
-        "For the most precise advice, I need to understand one more detail."
-    ],
-    "empathy": [
-        "I recognize this process can be complex. Rest assured, I'm here to guide you through each step.",
-        "Immigration procedures can be challenging, but together we'll navigate them effectively.",
-        "I understand your concerns. Let's address them systematically to ensure the best outcome."
-    ],
-    "action": [
-        "Based on your situation, here are the specific steps we should take:",
-        "Let me outline the precise actions needed for your case:",
-        "Here's what I recommend as your next steps:"
-    ],
-    "follow_up": [
-        "Is there anything specific about these steps you'd like me to explain further?",
-        "Would you like me to provide more details about any of these points?",
-        "Do you have any questions about the process I've outlined?"
-    ],
-    "closing": [
-        "I'm here to help if you have any more questions. Feel free to ask!",
-        "Don't hesitate to ask if you need clarification on anything I've explained.",
-        "I'm always happy to provide more detailed guidance if needed. Just let me know!"
-    ]
-}
-
-# Conversation starters based on client type
-CONVERSATION_STARTERS = {
-    "tech_worker": [
-        "Welcome. As your immigration specialist, I'm here to help with your tech industry immigration needs. What specific visa or immigration matter can I assist you with?",
-        "I specialize in tech industry immigration. Whether it's H-1B, O-1, or other visa categories, I'm here to guide you. What's your current situation?"
-    ],
-    "student": [
-        "Welcome. I'm here to assist with your student immigration matters. Are you interested in F-1 visas, OPT, or other student immigration options?",
-        "As your immigration advisor, I can help navigate student visa processes. What specific aspect of student immigration would you like to discuss?"
-    ],
-    "default": [
-        "Welcome. I'm Natalie, your dedicated immigration specialist. I'm here to provide expert guidance on your immigration journey. What specific assistance do you need?",
-        "I'm Natalie, your immigration advisor. I'm here to help you navigate the immigration process effectively. What immigration matters would you like to discuss?"
-    ]
-}
-
-# Global conversation state
-conversations: Dict[str, ConversationState] = {}
-
-QUESTION_GROUPS = {
-    'recent_grad': {
-        'background': [
-            "I'd love to hear more about your internship experience. What kind of projects did you work on?",
-            "Did you have the chance to do any research projects during your studies?",
-            "Were you involved in any coding competitions or hackathons?"
-        ],
-        'achievements': [
-            "Have you published any papers or made contributions to open-source projects?",
-            "Did you receive any academic awards or scholarships?",
-            "What was your favorite project or accomplishment during your studies?"
-        ],
-        'goals': [
-            "What kind of work are you most passionate about in computer science?",
-            "Do you have any specific companies or roles you're interested in?",
-            "Where do you see yourself in the next few years?"
-        ]
-    },
-    'tech_professional': {
-        'experience': [
-            "Could you tell me more about your current role and the impact you've made?",
-            "What kind of innovative projects have you led or contributed to?",
-            "Have you mentored others or led any teams?"
-        ],
-        'recognition': [
-            "Have you received any recognition or awards in your field?",
-            "Could you share any notable achievements or breakthroughs?",
-            "Have you spoken at any conferences or published any papers?"
-        ]
-    }
-}
-
-class ImmigrationCase:
-    def __init__(self, case_id: str):
-        self.case_id = case_id
-        self.details = {}
-        self.documents = []
-        self.timeline = []
-        
-    def update_details(self, details: dict):
-        self.details.update(details)
-        
-    def add_document(self, document: str):
-        self.documents.append(document)
-        
-    def add_timeline_event(self, event: dict):
-        self.timeline.append(event)
-
-# Active cases storage
-active_cases = {}
 
 async def handle_function_call(function_name: str, parameters: dict) -> dict:
     """Handle various function calls from Natalie"""
@@ -846,6 +504,16 @@ async def generate_advice_pdf(case_id: str, advice_content: dict) -> str:
     doc.build(content)
     return filename
 
+def stable_hash(text: str) -> str:
+    """Create a stable hash for a string."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+async def get_embedding(text: str, model="text-embedding-ada-002"):
+    """Get embedding for a text using OpenAI's API."""
+    text = text.replace("\n", " ")
+    response = await client.embeddings.create(input=[text], model=model)
+    return response.data[0].embedding
+
 async def get_relevant_context(query: str, chunks: List[str] = None) -> str:
     """Get relevant context for a query using semantic search."""
     try:
@@ -856,12 +524,7 @@ async def get_relevant_context(query: str, chunks: List[str] = None) -> str:
             chunks = await get_cached_chunks(text)
         
         # Get query embedding
-        query_response = await openai.Embeddings.create(
-            model="text-embedding-ada-002",
-            input=query,
-            encoding_format="float"
-        )
-        query_embedding = query_response.data[0].embedding
+        query_embedding = await get_embedding(query)
         
         # Get chunk embeddings
         chunk_embeddings = await get_cached_embeddings(chunks)
@@ -876,9 +539,9 @@ async def get_relevant_context(query: str, chunks: List[str] = None) -> str:
         top_indices = sorted(range(len(similarities)), key=lambda i: similarities[i], reverse=True)[:3]
         relevant_chunks = [chunks[i] for i in top_indices]
         
-        return "\n\n".join(relevant_chunks)
+        return "\n".join(relevant_chunks)
     except Exception as e:
-        logger.error(f"Error getting relevant context: {e}")
+        print(f"Error getting context: {str(e)}")
         return ""
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
@@ -911,7 +574,7 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
 
 async def get_cached_chunks(text: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     """Get chunks with caching."""
-    cache_key = f"{hash(text)}_{chunk_size}"
+    cache_key = stable_hash(f"{text}_{chunk_size}")
     chunks = chunk_cache.get(cache_key)
     if chunks is None:
         chunks = chunk_text(text, chunk_size)
@@ -926,7 +589,7 @@ async def get_cached_embeddings(chunks: List[str]) -> List[List[float]]:
 
     # Check cache first
     for i, chunk in enumerate(chunks):
-        chunk_key = hash(chunk)
+        chunk_key = stable_hash(chunk)
         cached = embedding_cache.get(chunk_key)
         if cached:
             embeddings.append(cached)
@@ -939,79 +602,160 @@ async def get_cached_embeddings(chunks: List[str]) -> List[List[float]]:
         batch_size = 5  # Small batch size for better streaming
         for i in range(0, len(to_process), batch_size):
             batch = to_process[i:i + batch_size]
-            response = await openai.Embeddings.create(
-                model="text-embedding-3-small",
+            response = await client.embeddings.create(
+                model="text-embedding-ada-002",  # Use consistent model
                 input=batch
             )
             
             # Cache and insert embeddings
-            for j, embedding in enumerate(response.data):
-                chunk = to_process[i + j]
-                embedding_cache.set(hash(chunk), embedding.embedding)
-                embeddings.insert(indices[i + j], embedding.embedding)
+            batch_embeddings = [e.embedding for e in response.data]
+            for j, emb in zip(range(i, min(i + batch_size, len(to_process))), batch_embeddings):
+                chunk_key = stable_hash(to_process[j])
+                embedding_cache.set(chunk_key, emb)
+                embeddings.insert(indices[j], emb)
     
     return embeddings
 
-async def get_chat_response(message: str) -> str:
+async def get_chat_response(message: str, conversation_id: str) -> Tuple[str, List[str]]:
+    """Get a response from the chatbot."""
     try:
-        # Get relevant context from immigration text
+        # Get relevant context
         context = await get_relevant_context(message)
-        
-        # Create messages for the chat
-        messages = [
-            {"role": "system", "content": LEGAL_CONTEXT},
-            {"role": "user", "content": f"Based on this context:\n\n{context}\n\nQuestion: {message}"}
-        ]
-        
-        # Get OpenAI response with function calling
-        completion = await openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            functions=get_functions_for_openai(),
-            function_call="auto",
-            temperature=0.7,
-            max_tokens=500
+
+        # Get or initialize conversation history
+        if conversation_id not in conversation_histories:
+            conversation_histories[conversation_id] = [
+                {"role": "system", "content": """You are Natalie Chen, a warm and approachable immigration lawyer with 10 years of experience, particularly in tech industry immigration. You have a JD from Stanford Law and previously worked at a top Silicon Valley law firm before starting your own practice.
+
+Your communication style:
+- Friendly and empathetic, but always professional
+- Use clear, everyday language instead of complex legal jargon
+- Break down complex concepts into digestible pieces
+- Acknowledge concerns and uncertainties
+- Offer practical next steps and guidance
+- Use occasional friendly phrases like "I understand this can feel overwhelming" or "Let me help you navigate this"
+- Share relevant anecdotes from your experience when appropriate (without naming names)
+- Always maintain accuracy and compliance with immigration law
+
+Remember to:
+1. Start responses with a brief acknowledgment of the question
+2. Provide accurate information based on the context
+3. Break down complex topics into clear steps
+4. End with an encouraging note and invitation for follow-up questions
+5. If something is unclear, ask for clarification rather than making assumptions
+6. Always provide 3 relevant follow-up questions or prompts at the end of your response"""}
+            ]
+
+        # Add user message to history
+        conversation_histories[conversation_id].append(
+            {"role": "user", "content": f"Based on this context:\n\n{context}\n\nQuestion: {message}\n\nAfter your response, suggest 3 relevant follow-up questions or prompts that would help guide the conversation forward."}
         )
 
-        # Extract the response
-        response_message = completion.choices[0].message
+        # Get completion from OpenAI
+        completion = client.chat.completions.create(
+            model="gpt-4",
+            messages=conversation_histories[conversation_id],
+            temperature=0.7,
+            max_tokens=1000
+        )
 
-        # Check if the model wants to call a function
-        if response_message.function_call is not None:
-            # Get function details
-            function_name = response_message.function_call.name
-            try:
-                function_args = json.loads(response_message.function_call.arguments)
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse function arguments: {response_message.function_call.arguments}")
-                return "I apologize, but I encountered an error processing your request. Please try again."
-            
-            # Call the function
-            function_response = await handle_function_call(function_name, function_args)
-            
-            # Add function response to conversation
-            messages.append(response_message)
-            messages.append({
-                "role": "function",
-                "name": function_name,
-                "content": json.dumps(function_response)
-            })
-            
-            # Get final response
-            final_completion = await openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=500
-            )
-            
-            return final_completion.choices[0].message.content
+        # Extract response and next prompts
+        full_response = completion.choices[0].message.content
         
-        return response_message.content
+        # Split the response into main content and next prompts
+        parts = full_response.split("\n\n")
+        main_response = parts[0]
+        next_prompts = []
+        
+        # Look for numbered questions/prompts in the remaining parts
+        for part in parts[1:]:
+            if re.search(r'^\d+[\)\.] ', part):
+                prompts = re.findall(r'^\d+[\)\.] (.+)$', part, re.MULTILINE)
+                next_prompts.extend(prompts)
+                if len(next_prompts) >= 3:
+                    next_prompts = next_prompts[:3]
+                    break
+
+        # If no prompts found in the structured format, generate them
+        if len(next_prompts) < 3:
+            follow_up_completion = client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You are helping to generate 3 relevant follow-up questions based on the previous response. Make them specific and actionable."},
+                    {"role": "user", "content": f"Based on this response:\n\n{main_response}\n\nGenerate 3 relevant follow-up questions that would help guide the conversation forward."}
+                ],
+                temperature=0.7,
+                max_tokens=200
+            )
+            next_prompts = re.findall(r'^\d+[\)\.] (.+)$', follow_up_completion.choices[0].message.content, re.MULTILINE)[:3]
+
+        # Add assistant's response to history
+        conversation_histories[conversation_id].append(
+            {"role": "assistant", "content": main_response}
+        )
+
+        # Trim history if it gets too long (keep last N messages)
+        if len(conversation_histories[conversation_id]) > 10:
+            conversation_histories[conversation_id] = (
+                [conversation_histories[conversation_id][0]] +  # Keep system message
+                conversation_histories[conversation_id][-9:]     # Keep last 9 messages
+            )
+
+        return main_response, next_prompts
 
     except Exception as e:
-        logger.error(f"Error generating response: {e}")
-        return "I apologize, but I encountered an error while generating a response. Please try again."
+        return f"I apologize, but I'm having some technical difficulties at the moment. Could you please repeat your question? Error details: {str(e)}", []
+
+async def stream_response(response_text: str, next_prompts: List[str] = None):
+    """Stream response with typewriter effect."""
+    words = response_text.split()
+    current_text = ""
+    
+    for i, word in enumerate(words):
+        current_text += word + " "
+        
+        # Format the response as a proper SSE message
+        message = {
+            "type": "stream",
+            "content": current_text.strip()
+        }
+        yield f"data: {json.dumps(message)}\n\n"
+        await asyncio.sleep(0.05)  # Add small delay for typewriter effect
+    
+    # Send next prompts if available
+    if next_prompts:
+        message = {
+            "type": "next_prompts",
+            "content": next_prompts
+        }
+        yield f"data: {json.dumps(message)}\n\n"
+    
+    # Send end message
+    yield f"data: {json.dumps({'type': 'end'})}\n\n"
+
+# Initialize FastAPI app
+app = FastAPI()
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize templates
+templates = Jinja2Templates(directory="templates")
+
+# Initialize static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
 @limiter.limit("60/minute")
@@ -1020,124 +764,27 @@ async def home(request: Request):
 
 @app.post("/chat")
 @limiter.limit("30/minute")
-async def chat(
-    request: Request,
-    api_key: str = Depends(verify_api_key)
-) -> StreamingResponse:
+async def chat(request: Request, api_key: str = Depends(verify_api_key)) -> StreamingResponse:
     """Chat endpoint that streams responses with rate limiting and authentication."""
     try:
         data = await request.json()
-        query = data.get("message", "")
+        message = data.get("message", "").strip()
         conversation_id = data.get("conversation_id", "default")
 
-        # Initialize conversation state if needed
-        if conversation_id not in conversations:
-            conversations[conversation_id] = ConversationState()
+        if not message:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Message cannot be empty"}
+            )
 
-        # Generate response
-        response = await get_chat_response(query)
-        
-        # Stream the response
+        response, next_prompts = await get_chat_response(message, conversation_id)
         return StreamingResponse(
-            stream_response(response),
+            stream_response(response, next_prompts),
             media_type="text/event-stream"
         )
 
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {e}")
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)}
+            content={"error": f"An error occurred: {str(e)}"}
         )
-
-@app.get("/download/{filename}")
-@limiter.limit("10/minute")
-async def download_pdf(
-    filename: str,
-    api_key: str = Depends(verify_api_key)
-):
-    """Serve generated PDF files with rate limiting and authentication."""
-    file_path = f"generated_pdfs/{filename}"
-    if os.path.exists(file_path):
-        return FileResponse(
-            file_path,
-            media_type="application/pdf",
-            filename=filename
-        )
-    return {"error": "File not found"}
-
-def find_available_port(start_port: int = 8000, max_tries: int = 10) -> int:
-    """Find an available port starting from start_port."""
-    for port in range(start_port, start_port + max_tries):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            try:
-                s.bind(('0.0.0.0', port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError(f"Could not find an available port in range {start_port}-{start_port + max_tries}")
-
-if __name__ == "__main__":
-    # Set up signal handlers
-    signal.signal(signal.SIGINT, signal_handler)   # Handle Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler)  # Handle termination request
-    
-    # Find available port
-    try:
-        port = find_available_port()
-        print(f"\nStarting server on port {port}")
-        
-        # Configure and start server
-        server_config = uvicorn.Config(app, host="0.0.0.0", port=port)
-        server = uvicorn.Server(server_config)
-        config['server'] = server
-        
-        server.run()
-    except KeyboardInterrupt:
-        print("\nReceived keyboard interrupt. Shutting down...")
-    except Exception as e:
-        print(f"\nError: {e}")
-    finally:
-        print("Server shutdown complete.")
-
-IMMIGRATION_SOURCES = {
-    "uscis_policy": {
-        "name": "USCIS Policy Manual",
-        "url": "https://www.uscis.gov/policy-manual",
-        "citation_format": "USCIS Policy Manual, Volume {volume}, Part {part}, Chapter {chapter}"
-    },
-    "ina": {
-        "name": "Immigration and Nationality Act",
-        "url": "https://www.uscis.gov/laws-and-policy/legislation/immigration-and-nationality-act",
-        "citation_format": "INA § {section}"
-    },
-    "cfr": {
-        "name": "Code of Federal Regulations",
-        "url": "https://www.ecfr.gov/current/title-8",
-        "citation_format": "8 CFR § {section}"
-    }
-}
-
-def get_personality_response(category: str) -> str:
-    """Get a random personality response from the specified category."""
-    return random.choice(PERSONALITY_TRAITS[category])
-
-def get_conversation_starter(client_type: str) -> str:
-    """Get a random conversation starter for the client type."""
-    return random.choice(CONVERSATION_STARTERS.get(client_type, CONVERSATION_STARTERS["default"]))
-
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-def get_functions_for_openai():
-    """Convert AVAILABLE_FUNCTIONS to OpenAI's format."""
-    functions = []
-    for name, details in AVAILABLE_FUNCTIONS.items():
-        function = {
-            "name": name,
-            "description": details["description"],
-            "parameters": details["parameters"]
-        }
-        functions.append(function)
-    return functions

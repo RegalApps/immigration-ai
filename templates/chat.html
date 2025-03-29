@@ -127,6 +127,27 @@
             border-radius: 4px;
             background: #ffebee;
         }
+        .next-prompts {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .next-prompt-button {
+            background: #f0f7ff;
+            border: 1px solid #cce4ff;
+            border-radius: 6px;
+            padding: 8px 12px;
+            cursor: pointer;
+            text-align: left;
+            transition: all 0.2s ease;
+            font-size: 0.9em;
+            color: #0066cc;
+        }
+        .next-prompt-button:hover {
+            background: #e3f2fd;
+            border-color: #99ceff;
+        }
     </style>
 </head>
 <body>
@@ -239,6 +260,7 @@
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
+                        'X-API-Key': 'test_key_123'  // Add API key header
                     },
                     body: JSON.stringify({
                         message: message,
@@ -248,7 +270,7 @@
 
                 if (!response.ok) {
                     const error = await response.json();
-                    throw new Error(error.error || 'Failed to get response');
+                    throw new Error(error.error || error.detail || 'Failed to get response');
                 }
 
                 const reader = response.body.getReader();
@@ -279,6 +301,24 @@
                                 assistantDiv.innerHTML = data.content;
                                 fullResponse = data.content;
                                 assistantDiv.scrollIntoView({ behavior: 'smooth' });
+                            } else if (data.type === 'next_prompts') {
+                                // Create next prompts container
+                                const promptsContainer = document.createElement('div');
+                                promptsContainer.className = 'next-prompts';
+                                
+                                // Add prompt buttons
+                                data.content.forEach(prompt => {
+                                    const button = document.createElement('button');
+                                    button.className = 'next-prompt-button';
+                                    button.textContent = prompt;
+                                    button.onclick = () => {
+                                        userInput.value = prompt;
+                                        sendMessage();
+                                    };
+                                    promptsContainer.appendChild(button);
+                                });
+                                
+                                assistantDiv.appendChild(promptsContainer);
                             } else if (data.type === 'end') {
                                 assistantDiv.classList.remove('typing');
                                 // Cache the complete response
