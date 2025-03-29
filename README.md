@@ -1,47 +1,72 @@
-# Legal RAG Chatbot
+# Immigration Chatbot
 
-A simple Retrieval-Augmented Generation (RAG) chatbot for legal text analysis, specifically focused on US immigration law. The chatbot processes plain text input and leverages OpenAI's GPT models to provide immigration law insights and advice.
+A FastAPI-based immigration chatbot using OpenAI's API with streaming responses and secure endpoints.
 
 ## Features
 
-- Local text processing and chunking
-- OpenAI embeddings for semantic search
-- Context-aware responses with legal expertise
-- Automated disclaimer generation for legal advice
+- Real-time streaming responses
+- Context-aware conversations
+- Secure API endpoints with rate limiting
+- PDF generation for immigration documents
+- Efficient embedding caching
+- Modern web interface
+
+## Tech Stack
+
+- FastAPI for the web server
+- OpenAI API for chat completions and embeddings
+- FAISS for vector similarity search
+- ReportLab for PDF generation
+- Slowapi for rate limiting
+- JWT for API authentication
 
 ## Setup
 
-1. Create and activate a Python virtual environment:
+1. Clone the repository:
+```bash
+git clone https://github.com/RegalApps/immigration-chatbot.git
+cd immigration-chatbot
+```
+
+2. Create a virtual environment and install dependencies:
 ```bash
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate  # On Windows: .\venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-2. Install required packages:
+3. Set up environment variables:
 ```bash
-pip install openai python-dotenv numpy pandas
+cp .env.example .env
+# Edit .env with your OpenAI API key and other settings
 ```
 
-3. Create a `.env` file in the project root:
-```
-OPENAI_API_KEY=your_api_key_here
-```
-
-## Usage
-
-1. Add your immigration law text to `immigration.txt`
-
-2. Run the chatbot:
+4. Run the server:
 ```bash
-python immigration_chatbot.py
+uvicorn immigration_chatbot:app --reload --port 8000
 ```
 
-The chatbot will:
-- Process and chunk the input text
-- Generate embeddings using OpenAI
-- Provide relevant responses based on the legal context
-- Include appropriate disclaimers with legal advice
+## API Documentation
 
-## Note
+- `/`: Web interface
+- `/chat`: Chat endpoint (requires API key)
+- `/download/{filename}`: Download generated PDFs (requires API key)
 
-This chatbot acts as a US Immigration lawyer with 10 years of experience in the tech industry. While it provides informed insights on immigration processes, visa requirements, and tech company immigration needs, all responses should be verified with a licensed legal professional.
+## Security
+
+- API key authentication
+- Rate limiting per endpoint
+- CORS middleware
+- Secure environment variable handling
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add some amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
