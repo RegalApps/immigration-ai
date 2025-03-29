@@ -59,6 +59,56 @@ uvicorn immigration_chatbot:app --reload --port 8000
 - CORS middleware
 - Secure environment variable handling
 
+## Branch Strategy
+
+### Branch Types
+- `main`: Production-ready code
+- `develop`: Integration branch for features
+- `feature/*`: New features or improvements
+- `bugfix/*`: Bug fixes
+- `hotfix/*`: Urgent fixes for production
+
+### Development Workflow
+1. Create a new branch from `develop`:
+   ```bash
+   git checkout develop
+   git pull origin develop
+   git checkout -b feature/your-feature-name
+   ```
+
+2. Make your changes and commit them:
+   ```bash
+   git add .
+   git commit -m "feat: your descriptive commit message"
+   ```
+
+3. Push your branch and create a pull request:
+   ```bash
+   git push origin feature/your-feature-name
+   ```
+
+4. Create a pull request on GitHub targeting the `develop` branch
+
+### Branch Protection Rules
+- All changes must be made through pull requests
+- Pull requests require:
+  - Passing CI checks
+  - Code review approval
+  - Up-to-date branch status
+- Direct pushes to `main` and `develop` are prohibited
+
+### Commit Message Format
+Follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
+- `feat:` New features
+- `fix:` Bug fixes
+- `docs:` Documentation changes
+- `test:` Adding or modifying tests
+- `refactor:` Code changes that neither fix bugs nor add features
+- `style:` Code style changes (formatting, etc.)
+- `chore:` Maintenance tasks
+
+Example: `feat: add clickable next prompts to chat interface`
+
 ## Contributing
 
 1. Fork the repository
